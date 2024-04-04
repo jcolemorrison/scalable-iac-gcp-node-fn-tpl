@@ -1,0 +1,108 @@
+name: Build and Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Archive production artifacts
+        run: zip -r "${{ secrets.TF_WORKSPACE_NAME }}-${{ github.ref_name }}.zip" .
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v0.2.1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Upload to GCS
+        run: gsutil cp "${{ secrets.TF_WORKSPACE_NAME }}-${{ github.ref_name }}.zip" gs://${{ secrets.GCS_BUCKET_NAME }}/
+
+      - name: Search for Terraform Cloud workspace
+        run: |
+          response=$(curl -G -s -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            --data-urlencode "search[name]=${{ secrets.TF_WORKSPACE_NAME }}" \
+            "https://app.terraform.io/api/v2/organizations/${{ secrets.TF_ORG_NAME }}/workspaces")
+
+          workspace_id=$(echo $response | jq -r '.data[0].id')
+
+          if [ "$workspace_id" == "null" ]; then
+            echo "Workspace not found"
+            exit 1
+          else
+            echo "Workspace ID: $workspace_id"
+            echo "TF_WORKSPACE_ID=$workspace_id" >> $GITHUB_ENV
+          fi
+      
+      - name: Trigger run in Terraform Cloud workspace
+        run: |
+          response=$(curl -s -X POST -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            -d '{
+              "data": {
+                "attributes": {
+                  "is-destroy": false,
+                  "message": "'"${{ github.event.head_commit.message }}"'",
+                  "variables": [
+                    { "key": "function_version_tag", "value": "\"${{ github.ref_name }}\"" }
+                  ]
+                },
+                "type": "runs",
+                "relationships": {
+                  "workspace": {
+                    "data": {
+                      "type": "workspaces",
+                      "id": "'"$TF_WORKSPACE_ID"'"
+                    }
+                  }
+                }
+              }
+            }' \
+            "https://app.terraform.io/api/v2/runs")
+
+          run_id=$(echo $response | jq -r '.data.id')
+
+          if [ "$run_id" == "null" ]; then
+            echo "Failed to trigger run"
+            exit 1
+          else
+            echo "Triggered run with ID: $run_id"
+          fi
+
+      # Actions requires "Workflow Permissions" set to "Read and Write" in Repo Settings > Actions > General for this to work
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Asset
+        id: upload-release-asset 
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: "./${{ secrets.TF_WORKSPACE_NAME }}-${{ github.ref_name }}.zip"
+          asset_name: "${{ secrets.TF_WORKSPACE_NAME }}-${{ github.ref_name }}.zip"
+          asset_content_type: application/zip
