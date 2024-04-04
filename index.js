@@ -2,7 +2,7 @@ const functions = require('@google-cloud/functions-framework');
 const redis = require('redis');
 
 const client = redis.createClient({
-  url: process.env.REDIS_HOST,
+  url: `redis://${process.env.REDIS_HOST}`,
   disableClientInfo: true
 })
 
